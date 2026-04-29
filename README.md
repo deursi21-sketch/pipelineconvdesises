@@ -1,5 +1,5 @@
 # 💱 Currency Converter App — Guide de déploiement complet
-RSI21
+RSI21 pipeline
 Application de conversion de devises (170+ devises incluant le TND), déployée sur AWS EC2 via Terraform et GitHub Actions.
 
 ---
