@@ -1,0 +1,229 @@
+name: 🚀 Deploy Currency Converter App
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  # ═══════════════════════════════════════════
+  # JOB 1 - Provisioning de l'infrastructure EC2 via Terraform
+  # ═══════════════════════════════════════════
+  job1-provision-infrastructure:
+    name: "🏗️ Job1 - Provision EC2 avec Terraform"
+    runs-on: ubuntu-latest
+
+    outputs:
+      public_ip: ${{ steps.get_ip.outputs.public_ip }}
+
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Configuration des credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.0
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Terraform Validate
+        working-directory: terraform
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: terraform
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+
+      - name: Récupération de l'IP publique
+        id: get_ip
+        working-directory: terraform
+        run: |
+          IP=$(terraform output -raw public_ip)
+          echo "public_ip=$IP" >> $GITHUB_OUTPUT
+          echo "✅ Instance EC2 créée avec IP: $IP"
+
+      - name: Attente que l'instance soit prête (SSH)
+        run: |
+          IP=${{ steps.get_ip.outputs.public_ip }}
+          echo "⏳ Attente de l'instance $IP..."
+          for i in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+              -i <(echo "${{ secrets.EC2_SSH_KEY }}") \
+              ubuntu@$IP "echo ok" 2>/dev/null; then
+              echo "✅ Instance SSH prête !"
+              exit 0
+            fi
+            echo "Tentative $i/30... attente 15s"
+            sleep 15
+          done
+          echo "❌ Timeout SSH" && exit 1
+
+  # ═══════════════════════════════════════════
+  # JOB 2 - Installation des prérequis sur l'instance
+  # ═══════════════════════════════════════════
+  job2-install-prerequisites:
+    name: "📦 Job2 - Installation des prérequis"
+    runs-on: ubuntu-latest
+    needs: job1-provision-infrastructure
+
+    env:
+      EC2_IP: ${{ needs.job1-provision-infrastructure.outputs.public_ip }}
+
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Écriture de la clé SSH
+        run: |
+          echo "${{ secrets.EC2_SSH_KEY }}" > /tmp/vockey.pem
+          chmod 600 /tmp/vockey.pem
+
+      - name: Installation de Node.js 20, npm, pm2 sur l'instance
+        run: |
+          ssh -o StrictHostKeyChecking=no -i /tmp/vockey.pem ubuntu@$EC2_IP << 'ENDSSH'
+            set -e
+            echo "🔄 Mise à jour du système..."
+            sudo apt-get update -y && sudo apt-get upgrade -y
+
+            echo "📦 Installation de curl et git..."
+            sudo apt-get install -y curl git build-essential
+
+            echo "📦 Installation de Node.js 20 LTS..."
+            curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+            sudo apt-get install -y nodejs
+
+            echo "📦 Installation de PM2 (gestionnaire de processus)..."
+            sudo npm install -g pm2
+
+            echo "📦 Installation de serve (pour le frontend build)..."
+            sudo npm install -g serve
+
+            echo "✅ Vérification des versions installées:"
+            node --version
+            npm --version
+            pm2 --version
+            serve --version
+          ENDSSH
+
+      - name: Déploiement des fichiers de l'application
+        run: |
+          # Copie du backend
+          ssh -o StrictHostKeyChecking=no -i /tmp/vockey.pem ubuntu@$EC2_IP "mkdir -p ~/currency-app/backend ~/currency-app/frontend"
+          scp -o StrictHostKeyChecking=no -i /tmp/vockey.pem \
+            backend/server.js backend/package.json \
+            ubuntu@$EC2_IP:~/currency-app/backend/
+
+          # Copie du frontend
+          scp -o StrictHostKeyChecking=no -i /tmp/vockey.pem -r \
+            frontend/src frontend/public frontend/package.json \
+            ubuntu@$EC2_IP:~/currency-app/frontend/
+
+      - name: Installation des dépendances npm
+        run: |
+          ssh -o StrictHostKeyChecking=no -i /tmp/vockey.pem ubuntu@$EC2_IP << ENDSSH
+            set -e
+            echo "📦 Installation des dépendances backend..."
+            cd ~/currency-app/backend
+            npm install --production
+
+            echo "📦 Installation des dépendances frontend..."
+            cd ~/currency-app/frontend
+            npm install
+            echo "✅ Toutes les dépendances sont installées !"
+          ENDSSH
+
+  # ═══════════════════════════════════════════
+  # JOB 3 - Mise en production (build + lancement)
+  # ═══════════════════════════════════════════
+  job3-deploy-production:
+    name: "🚀 Job3 - Mise en production"
+    runs-on: ubuntu-latest
+    needs: [job1-provision-infrastructure, job2-install-prerequisites]
+
+    env:
+      EC2_IP: ${{ needs.job1-provision-infrastructure.outputs.public_ip }}
+
+    steps:
+      - name: Écriture de la clé SSH
+        run: |
+          echo "${{ secrets.EC2_SSH_KEY }}" > /tmp/vockey.pem
+          chmod 600 /tmp/vockey.pem
+
+      - name: Build du frontend React
+        run: |
+          ssh -o StrictHostKeyChecking=no -i /tmp/vockey.pem ubuntu@$EC2_IP << ENDSSH
+            set -e
+            echo "🔨 Build du frontend React..."
+            cd ~/currency-app/frontend
+            export REACT_APP_API_URL="http://$EC2_IP:5000"
+            npm run build
+            echo "✅ Build React terminé !"
+          ENDSSH
+
+      - name: Lancement du backend avec PM2
+        run: |
+          ssh -o StrictHostKeyChecking=no -i /tmp/vockey.pem ubuntu@$EC2_IP << 'ENDSSH'
+            set -e
+            echo "🚀 Lancement du backend Node.js..."
+            pm2 delete currency-backend 2>/dev/null || true
+            cd ~/currency-app/backend
+            pm2 start server.js --name currency-backend
+            pm2 save
+            pm2 startup | grep "sudo" | bash || true
+            echo "✅ Backend lancé !"
+          ENDSSH
+
+      - name: Lancement du frontend avec serve
+        run: |
+          ssh -o StrictHostKeyChecking=no -i /tmp/vockey.pem ubuntu@$EC2_IP << 'ENDSSH'
+            set -e
+            echo "🚀 Lancement du frontend React (build)..."
+            pm2 delete currency-frontend 2>/dev/null || true
+            cd ~/currency-app/frontend
+            pm2 start "serve -s build -l 3000" --name currency-frontend
+            pm2 save
+            echo "✅ Frontend lancé !"
+          ENDSSH
+
+      - name: Vérification du déploiement
+        run: |
+          sleep 8
+          echo "🔍 Vérification santé du backend..."
+          curl -sf "http://$EC2_IP:5000/health" && echo "✅ Backend OK" || echo "⚠️ Backend pas encore prêt"
+
+          echo "🔍 Vérification du frontend..."
+          curl -sf "http://$EC2_IP:3000" > /dev/null && echo "✅ Frontend OK" || echo "⚠️ Frontend pas encore prêt"
+
+      - name: 🎉 Résumé du déploiement
+        run: |
+          echo "╔══════════════════════════════════════════════════╗"
+          echo "║         ✅ DÉPLOIEMENT RÉUSSI !                  ║"
+          echo "╠══════════════════════════════════════════════════╣"
+          echo "║  🌐 Frontend (React) :                           ║"
+          echo "║     http://$EC2_IP:3000                          ║"
+          echo "║                                                  ║"
+          echo "║  🔌 Backend (API) :                              ║"
+          echo "║     http://$EC2_IP:5000                          ║"
+          echo "║                                                  ║"
+          echo "║  🔑 SSH :                                        ║"
+          echo "║     ssh -i vockey.pem ubuntu@$EC2_IP             ║"
+          echo "╚══════════════════════════════════════════════════╝"
